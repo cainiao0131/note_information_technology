@@ -88,7 +88,11 @@ WebSecurityConfiguration 类
    而 doBuild() 有多个固定逻辑：init()、configure()、performBuild()  
    其中 performBuild() 为抽象方法，由 WebSecurity 重写
 1. 构建者  
-   WebSecurity（SecurityBuilder<Filter&gt;）、HttpSecurity（SecurityBuilder<DefaultSecurityFilterChain&gt;）
+   WebSecurity（SecurityBuilder<Filter&gt;）  
+   HttpSecurity（SecurityBuilder<DefaultSecurityFilterChain&gt;）
+1. 状态机  
+   AbstractConfiguredSecurityBuilder.doBuild() 中有多个状态的设置操作  
+   private BuildState buildState = BuildState.UNBUILT;
 
 ## 源码
 
@@ -142,7 +146,7 @@ setFilterChainProxySecurityConfigurer() 的方法参数由依赖注入设置
 可见，这里就是 new 了一个 WebSecurity 赋值给 this.webSecurity  
 并且为 webSecurity 设置了 webSecurityConfigurers（客户端程序员定义的 WebSecurityConfigurerAdapter 包括在其中）
 
-**(2) 构建过程**
+**(2) WebSecurity 构建 FilterChainProxy**
 
 this.webSecurity.build() 构建 Filter 对象（FilterChainProxy 对象）  
 即，WebSecurity 的 build() 方法
@@ -169,16 +173,18 @@ public abstract class AbstractSecurityBuilder<O> implements SecurityBuilder<O> {
 
 	private O object;
 
-	@Override
-	public final O build() throws Exception {
-		if (this.building.compareAndSet(false, true)) {
-			this.object = doBuild();
-			return this.object;
-		}
-		throw new AlreadyBuiltException("This object has already been built");
-	}
-    ...
-    protected abstract O doBuild() throws Exception;
+   @Override
+   public final O build() throws Exception {
+      // 防止重复构建
+      if (this.building.compareAndSet(false, true)) {
+         // AbstractConfiguredSecurityBuilder.doBuild()
+         this.object = doBuild();
+         return this.object;
+      }
+      throw new AlreadyBuiltException("This object has already been built");
+   }
+   ...
+   protected abstract O doBuild() throws Exception;
 }
 ~~~
 
@@ -209,6 +215,7 @@ public abstract class AbstractConfiguredSecurityBuilder<O, B extends SecurityBui
 			// 循环调用 SecurityConfigurer<Filter, WebSecurity> 的 configure() 方法
 			configure();
 			this.buildState = BuildState.BUILDING;
+			// 构建 FilterChainProxy，WebSecurity.performBuild()
 			O result = performBuild();
 			this.buildState = BuildState.BUILT;
 			return result;
@@ -239,14 +246,6 @@ public abstract class AbstractConfiguredSecurityBuilder<O, B extends SecurityBui
 }
 ~~~
 
-如果客户端程序员继承了 WebSecurityConfigurerAdapter  
-并且加上 @Component 注解将其放入了 Spring 容器（没有加入 Spring 容器是不行的）    
-上边 init() 方法中的 configurer 就是客户端程序员定义的类的对象  
-init() 方法就是 WebSecurityConfigurerAdapter 的 init(WebSecurity web) 方法  
-其中，会调用 getHttp() 方法  
-getHttp() 方法会调用 configure(this.http)  
-configure(this.http) 可以被客户端程序员重写
-
 ~~~ java
 package org.springframework.security.config.annotation.web.configuration;
 
@@ -270,7 +269,8 @@ public abstract class WebSecurityConfigurerAdapter implements WebSecurityConfigu
 			List<AbstractHttpConfigurer> defaultHttpConfigurers = SpringFactoriesLoader
 					.loadFactories(AbstractHttpConfigurer.class, classLoader);
 			for (AbstractHttpConfigurer configurer : defaultHttpConfigurers) {
-				this.http.apply(configurer);
+			   // 将一个 configurer 列表加入到 http 的 configurers 中
+			   this.http.apply(configurer);
 			}
 		}
 		// 客户端程序员定义的 WebSecurityConfigurerAdapter.configure(HttpSecurity http) 被调用
@@ -293,3 +293,178 @@ public abstract class WebSecurityConfigurerAdapter implements WebSecurityConfigu
 }
 ~~~
 
+~~~ java
+package org.springframework.security.config.annotation.web.builders;
+
+public final class WebSecurity extends AbstractConfiguredSecurityBuilder<Filter, WebSecurity>
+	implements SecurityBuilder<Filter>, ApplicationContextAware {
+   ...
+   @Override
+	protected Filter performBuild() throws Exception {
+		Assert.state(!this.securityFilterChainBuilders.isEmpty(),
+				() -> "At least one SecurityBuilder<? extends SecurityFilterChain> needs to be specified. "
+						+ "Typically this is done by exposing a SecurityFilterChain bean "
+						+ "or by adding a @Configuration that extends WebSecurityConfigurerAdapter. "
+						+ "More advanced users can invoke " + WebSecurity.class.getSimpleName()
+						+ ".addSecurityFilterChainBuilder directly");
+		int chainSize = this.ignoredRequests.size() + this.securityFilterChainBuilders.size();
+		List<SecurityFilterChain> securityFilterChains = new ArrayList<>(chainSize);
+		for (RequestMatcher ignoredRequest : this.ignoredRequests) {
+			securityFilterChains.add(new DefaultSecurityFilterChain(ignoredRequest));
+		}
+		for (SecurityBuilder<? extends SecurityFilterChain> securityFilterChainBuilder : this.securityFilterChainBuilders) {
+		    // 构建 SecurityFilterChain，HttpSecurity.build()
+			securityFilterChains.add(securityFilterChainBuilder.build());
+		}
+		// new 了一个 FilterChainProxy 对象
+		FilterChainProxy filterChainProxy = new FilterChainProxy(securityFilterChains);
+		if (this.httpFirewall != null) {
+			filterChainProxy.setFirewall(this.httpFirewall);
+		}
+		if (this.requestRejectedHandler != null) {
+			filterChainProxy.setRequestRejectedHandler(this.requestRejectedHandler);
+		}
+		filterChainProxy.afterPropertiesSet();
+
+		Filter result = filterChainProxy;
+		if (this.debugEnabled) {
+			this.logger.warn("\n\n" + "********************************************************************\n"
+					+ "**********        Security debugging is enabled.       *************\n"
+					+ "**********    This may include sensitive information.  *************\n"
+					+ "**********      Do not use in a production system!     *************\n"
+					+ "********************************************************************\n\n");
+			result = new DebugFilter(filterChainProxy);
+		}
+		this.postBuildAction.run();
+		return result;
+	}
+   ...
+}
+~~~
+
+**(3) HttpSecurity 构建 SecurityFilterChain**
+
+HttpSecurity.build()  
+和 WebSecurity.build() 一样，HttpSecurity 也是一个 SecurityBuilder.build()  
+先是 AbstractSecurityBuilder.build() 保证不重复构建  
+然后是 AbstractConfiguredSecurityBuilder.doBuild() 模板方法  
+1. 遍历 AbstractConfiguredSecurityBuilder.configurers.init(HttpSecurity)
+1. 遍历 AbstractConfiguredSecurityBuilder.configurers.configure(HttpSecurity)
+1. HttpSecurity.performBuild() 返回 DefaultSecurityFilterChain 对象
+
+~~~ java
+package org.springframework.security.config.annotation.web.builders;
+
+public final class HttpSecurity extends AbstractConfiguredSecurityBuilder<DefaultSecurityFilterChain, HttpSecurity>
+	implements SecurityBuilder<DefaultSecurityFilterChain>, HttpSecurityBuilder<HttpSecurity> {
+	...
+	private List<OrderedFilter> filters = new ArrayList<>();
+	
+	private RequestMatcher requestMatcher = AnyRequestMatcher.INSTANCE;
+	
+	private FilterOrderRegistration filterOrders = new FilterOrderRegistration();
+	...
+	@Override
+	protected DefaultSecurityFilterChain performBuild() { // 2618
+		this.filters.sort(OrderComparator.INSTANCE);
+		List<Filter> sortedFilters = new ArrayList<>(this.filters.size());
+		for (Filter filter : this.filters) {
+			sortedFilters.add(((OrderedFilter) filter).filter);
+		}
+		return new DefaultSecurityFilterChain(this.requestMatcher, sortedFilters);
+	}
+	...
+	@Override
+	public HttpSecurity addFilter(Filter filter) { // 2660
+		Integer order = this.filterOrders.getOrder(filter.getClass());
+		if (order == null) {
+			throw new IllegalArgumentException("The Filter class " + filter.getClass().getName()
+               + " does not have a registered order and cannot be added without a specified order. Consider using addFilterBefore or addFilterAfter instead.");
+		}
+		this.filters.add(new OrderedFilter(filter, order));
+		return this;
+	}
+	...
+~~~
+
+下边以 OAuth2ClientConfigurer 为例，熟悉下配置的一般过程
+
+~~~ java
+package org.springframework.security.config.annotation.web.configurers.oauth2.client;
+
+public final class OAuth2ClientConfigurer<B extends HttpSecurityBuilder<B>>
+   extends AbstractHttpConfigurer<OAuth2ClientConfigurer<B>, B> {
+   
+   private AuthorizationCodeGrantConfigurer authorizationCodeGrantConfigurer = new AuthorizationCodeGrantConfigurer();
+   ...
+   @Override
+   public void init(B builder) {
+     this.authorizationCodeGrantConfigurer.init(builder);
+   }
+   
+   @Override
+   public void configure(B builder) {
+     this.authorizationCodeGrantConfigurer.configure(builder);
+   }
+   
+   public final class AuthorizationCodeGrantConfigurer {
+      ...
+      private void init(B builder) {
+         OAuth2AuthorizationCodeAuthenticationProvider
+            authorizationCodeAuthenticationProvider = new OAuth2AuthorizationCodeAuthenticationProvider(
+               getAccessTokenResponseClient());
+         builder.authenticationProvider(postProcess(authorizationCodeAuthenticationProvider));
+      }
+      
+      private void configure(B builder) {
+         OAuth2AuthorizationRequestRedirectFilter
+            authorizationRequestRedirectFilter = createAuthorizationRequestRedirectFilter(builder);
+         // 在 HttpSecurity.filters 中增加一个 OAuth2AuthorizationRequestRedirectFilter
+         builder.addFilter(postProcess(authorizationRequestRedirectFilter));
+         OAuth2AuthorizationCodeGrantFilter authorizationCodeGrantFilter = createAuthorizationCodeGrantFilter(builder);
+         builder.addFilter(postProcess(authorizationCodeGrantFilter));
+      }
+      ...
+   }
+   
+}
+~~~
+
+**(4) 客户端程序员配置**
+
+前文提到 HttpSecurity（SecurityBuilder<DefaultSecurityFilterChain&gt;）持有：configurers  
+对应多个：SecurityConfigurer<DefaultSecurityFilterChain, HttpSecurity>>  
+其中一个 configurer 就是：OAuth2ClientConfigurer<HttpSecurity>
+
+~~~ java
+@Component
+public class MySecurityConfig extends WebSecurityConfigurerAdapter {
+
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http.oauth2Client(oAuth2ClientConfigurer -> {});
+    }
+
+}
+~~~
+
+HttpSecurity.oauth2Client(oAuth2ClientConfigurer -> {})
+1. 如果 HttpSecurity 的 configurers 中还没有 OAuth2ClientConfigurer<HttpSecurity> 类的对象  
+   则 new 一个并将其加入 http 的 configurers，如果有则取出这个对象
+1. 执行 oauth2ClientCustomizer.customize(OAuth2ClientConfigurer<HttpSecurity>)  
+   Customizer<OAuth2ClientConfigurer<HttpSecurity>> 就是客户自定义的匿名内部类对象（上边的拉姆达表达式）
+
+~~~ java
+package org.springframework.security.config.annotation.web.builders;
+
+public final class HttpSecurity extends AbstractConfiguredSecurityBuilder<DefaultSecurityFilterChain, HttpSecurity>
+	implements SecurityBuilder<DefaultSecurityFilterChain>, HttpSecurityBuilder<HttpSecurity> {
+    
+    ...
+	public HttpSecurity oauth2Client(Customizer<OAuth2ClientConfigurer<HttpSecurity>> oauth2ClientCustomizer)
+			throws Exception {
+		oauth2ClientCustomizer.customize(getOrApply(new OAuth2ClientConfigurer<>()));
+		return HttpSecurity.this;
+	}
+	...
+~~~
